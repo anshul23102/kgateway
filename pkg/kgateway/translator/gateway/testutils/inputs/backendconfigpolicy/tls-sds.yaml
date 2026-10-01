@@ -1,0 +1,96 @@
+kind: Gateway
+apiVersion: gateway.networking.k8s.io/v1
+metadata:
+  name: example-gateway
+spec:
+  gatewayClassName: kgateway
+  listeners:
+  - protocol: HTTP
+    port: 8080
+    name: http
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  labels:
+    app: backend
+    service: backend
+spec:
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+      appProtocol: https
+  selector:
+    app: backend
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service2
+  labels:
+    app: backend
+    service: backend
+spec:
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+      appProtocol: https
+  selector:
+    app: backend
+---
+kind: BackendConfigPolicy
+apiVersion: gateway.kgateway.dev/v1alpha1
+metadata:
+  name: sds-mtls
+spec:
+  targetRefs:
+    - name: backend-service
+      group: ""
+      kind: Service
+  tls:
+    sni: test.example.com
+    sds:
+      clusterName: spire_agent
+      certificateSecretName: spiffe://example.org/ns/default/sa/client
+      validationContextName: spiffe://example.org
+    verifySubjectAltNames:
+      - spiffe://example.org/ns/default/sa/backend
+---
+kind: BackendConfigPolicy
+apiVersion: gateway.kgateway.dev/v1alpha1
+metadata:
+  name: sds-validation-only
+spec:
+  targetRefs:
+    - name: backend-service2
+      group: ""
+      kind: Service
+  tls:
+    sni: test.example.com
+    sds:
+      clusterName: spire_agent
+      validationContextName: spiffe://example.org
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-route
+spec:
+  parentRefs:
+    - name: example-gateway
+  hostnames:
+    - "example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: backend-service
+          port: 443
