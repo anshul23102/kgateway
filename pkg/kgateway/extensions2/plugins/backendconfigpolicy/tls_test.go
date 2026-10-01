@@ -696,6 +696,44 @@ func TestTranslateTLSConfigSDS(t *testing.T) {
 			},
 		},
 		{
+			name: "SPIFFE IDs are matched as URI SANs",
+			tls: &kgateway.TLS{
+				VerifySubjectAltNames: []string{"spiffe://example.org/ns/default/sa/backend", "backend.example.com"},
+				SDS: &kgateway.SDS{
+					ClusterName:           clusterName,
+					ValidationContextName: new("spiffe://example.org"),
+				},
+			},
+			expected: &envoytlsv3.UpstreamTlsContext{
+				CommonTlsContext: &envoytlsv3.CommonTlsContext{
+					ValidationContextType: &envoytlsv3.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &envoytlsv3.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &envoytlsv3.CertificateValidationContext{
+								MatchTypedSubjectAltNames: []*envoytlsv3.SubjectAltNameMatcher{
+									{
+										SanType: envoytlsv3.SubjectAltNameMatcher_URI,
+										Matcher: &envoymatcher.StringMatcher{
+											MatchPattern: &envoymatcher.StringMatcher_Exact{Exact: "spiffe://example.org/ns/default/sa/backend"},
+										},
+									},
+									{
+										SanType: envoytlsv3.SubjectAltNameMatcher_DNS,
+										Matcher: &envoymatcher.StringMatcher{
+											MatchPattern: &envoymatcher.StringMatcher_Exact{Exact: "backend.example.com"},
+										},
+									},
+								},
+							},
+							ValidationContextSdsSecretConfig: &envoytlsv3.SdsSecretConfig{
+								Name:      "spiffe://example.org",
+								SdsConfig: expectedSdsConfig(),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "SNI is preserved alongside SDS",
 			tls: &kgateway.TLS{
 				Sni: new("backend.example.com"),
@@ -723,6 +761,47 @@ func TestTranslateTLSConfigSDS(t *testing.T) {
 			result, err := translateTLSConfig(NewMockSecretGetter(), tt.tls, "default")
 			require.NoError(t, err)
 			assert.Empty(t, cmp.Diff(tt.expected, result, protocmp.Transform()))
+		})
+	}
+}
+
+func TestTranslateTLSConfigSDSInvalid(t *testing.T) {
+	const clusterName = "spire_agent"
+
+	tests := []struct {
+		name        string
+		tls         *kgateway.TLS
+		expectedErr string
+	}{
+		{
+			name: "SAN matchers without a validation context are rejected",
+			tls: &kgateway.TLS{
+				VerifySubjectAltNames: []string{"spiffe://example.org/ns/default/sa/backend"},
+				SDS: &kgateway.SDS{
+					ClusterName:           clusterName,
+					CertificateSecretName: new("spiffe://example.org/ns/default/sa/client"),
+				},
+			},
+			expectedErr: "sds.validationContextName must be provided if verifySubjectAltNames is not empty",
+		},
+		{
+			name: "simpleTLS without a validation context is rejected",
+			tls: &kgateway.TLS{
+				SimpleTLS: new(true),
+				SDS: &kgateway.SDS{
+					ClusterName:           clusterName,
+					CertificateSecretName: new("spiffe://example.org/ns/default/sa/client"),
+				},
+			},
+			expectedErr: "sds.validationContextName must be provided if simpleTLS is true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := translateTLSConfig(NewMockSecretGetter(), tt.tls, "default")
+			require.EqualError(t, err, tt.expectedErr)
+			assert.Nil(t, result, "no TLS context should be produced for an invalid SDS config")
 		})
 	}
 }

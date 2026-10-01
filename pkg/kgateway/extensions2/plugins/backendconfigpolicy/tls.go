@@ -3,6 +3,7 @@ package backendconfigpolicy
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoytlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -221,13 +222,29 @@ func sdsConfigSource(clusterName string) *envoycorev3.ConfigSource {
 }
 
 // buildSDSContext wires the client certificate and/or the validation context to
-// SDS. At least one of the two names is guaranteed to be set by the AtLeastOneOf
-// marker on the SDS type, so this cannot produce an empty TLS context.
-func buildSDSContext(tlsConfig *kgateway.TLS, tlsContext *envoytlsv3.CommonTlsContext) {
+// SDS. The AtLeastOneOf marker on the SDS type guarantees one of the two names is
+// set, but simpleTLS and verifySubjectAltNames interact with them, so those
+// combinations are rejected here rather than silently producing a TLS context
+// that is empty or that ignores user configuration.
+func buildSDSContext(tlsConfig *kgateway.TLS, tlsContext *envoytlsv3.CommonTlsContext) error {
 	sds := tlsConfig.SDS
+	simpleTLS := ptr.Deref(tlsConfig.SimpleTLS, false)
+
+	if sds.ValidationContextName == nil {
+		// Without a validation context there is nothing to verify the backend
+		// against, so SAN matchers would be dropped. The secretRef and files paths
+		// reject the same mistake in buildValidationContext.
+		if len(tlsConfig.VerifySubjectAltNames) > 0 {
+			return errors.New("sds.validationContextName must be provided if verifySubjectAltNames is not empty")
+		}
+		// simpleTLS drops the client certificate, which would leave this context empty.
+		if simpleTLS {
+			return errors.New("sds.validationContextName must be provided if simpleTLS is true")
+		}
+	}
 
 	// Client certificate, used for mTLS to the backend. Skipped for one-way TLS.
-	if sds.CertificateSecretName != nil && !ptr.Deref(tlsConfig.SimpleTLS, false) {
+	if sds.CertificateSecretName != nil && !simpleTLS {
 		tlsContext.TlsCertificateSdsSecretConfigs = []*envoytlsv3.SdsSecretConfig{
 			{
 				Name:      *sds.CertificateSecretName,
@@ -237,7 +254,7 @@ func buildSDSContext(tlsConfig *kgateway.TLS, tlsContext *envoytlsv3.CommonTlsCo
 	}
 
 	if sds.ValidationContextName == nil {
-		return
+		return nil
 	}
 
 	// The trust bundle comes from SDS. SAN matchers, when present, must be
@@ -248,7 +265,7 @@ func buildSDSContext(tlsConfig *kgateway.TLS, tlsContext *envoytlsv3.CommonTlsCo
 		SdsConfig: sdsConfigSource(sds.ClusterName),
 	}
 
-	if sanMatchers := verifySanListToTypedMatchSanList(tlsConfig.VerifySubjectAltNames); len(sanMatchers) > 0 {
+	if sanMatchers := sdsSanListToTypedMatchSanList(tlsConfig.VerifySubjectAltNames); len(sanMatchers) > 0 {
 		tlsContext.ValidationContextType = &envoytlsv3.CommonTlsContext_CombinedValidationContext{
 			CombinedValidationContext: &envoytlsv3.CommonTlsContext_CombinedCertificateValidationContext{
 				DefaultValidationContext: &envoytlsv3.CertificateValidationContext{
@@ -257,12 +274,30 @@ func buildSDSContext(tlsConfig *kgateway.TLS, tlsContext *envoytlsv3.CommonTlsCo
 				ValidationContextSdsSecretConfig: validationSdsConfig,
 			},
 		}
-		return
+		return nil
 	}
 
 	tlsContext.ValidationContextType = &envoytlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
 		ValidationContextSdsSecretConfig: validationSdsConfig,
 	}
+	return nil
+}
+
+// spiffeIDPrefix is the URI scheme of a SPIFFE ID.
+const spiffeIDPrefix = "spiffe://"
+
+// sdsSanListToTypedMatchSanList is like verifySanListToTypedMatchSanList, but
+// matches SPIFFE IDs as URI SANs. SDS is the integration point for SPIFFE/SPIRE,
+// and the SPIFFE specification carries the identity in a URI SAN, so the DNS
+// matcher used elsewhere would never match.
+func sdsSanListToTypedMatchSanList(sanList []string) []*envoytlsv3.SubjectAltNameMatcher {
+	matchers := verifySanListToTypedMatchSanList(sanList)
+	for i, san := range sanList {
+		if strings.HasPrefix(san, spiffeIDPrefix) {
+			matchers[i].SanType = envoytlsv3.SubjectAltNameMatcher_URI
+		}
+	}
+	return matchers
 }
 
 func translateTLSConfig(
@@ -291,7 +326,9 @@ func translateTLSConfig(
 		// SDS supplies the certificate and/or the trust bundle over a gRPC stream
 		// rather than as inline or file-backed DataSources, so it bypasses the
 		// DataSource construction in buildTLSContext entirely.
-		buildSDSContext(tlsConfig, tlsContext)
+		if err := buildSDSContext(tlsConfig, tlsContext); err != nil {
+			return nil, err
+		}
 	default:
 		if err := buildTLSContext(tlsConfig, secretGetter, namespace, tlsContext); err != nil {
 			return nil, err
